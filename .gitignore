@@ -1,0 +1,10 @@
+.env
+output/
+node_modules/
+artifacts/
+cache/
+deployment.json
+__pycache__/
+*.pyc
+.venv/
+models/
