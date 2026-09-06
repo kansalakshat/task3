@@ -114,9 +114,14 @@ def _connect():
     # the old address. Without this check web3 fails deep in a contract call
     # with an opaque BadFunctionCallOutput instead of saying "redeploy".
     if len(w3.eth.get_code(address)) == 0:
+        why = (
+            "the local chain was probably restarted, which wipes its state"
+            if is_local
+            else "the contract was never deployed here, or the address is wrong"
+        )
         raise ConnectionError(
-            f"no contract at {address} on '{deployment['network']}' -- the chain "
-            f"was probably restarted. Redeploy:\n"
+            f"no contract at {address} on '{deployment['network']}' -- {why}. "
+            f"Redeploy:\n"
             f"  npx hardhat run scripts/deploy.js --network {deployment['network']}"
         )
 
@@ -126,11 +131,17 @@ def _connect():
 
 def _store(w3, contract, account, record_id, data_hash):
     """Send storeRecord and wait for the receipt. Returns the tx hash."""
-    tx = contract.functions.storeRecord(record_id, data_hash).build_transaction({
+    params = {
         "from": account.address,
         "nonce": w3.eth.get_transaction_count(account.address),
         "chainId": w3.eth.chain_id,
-    })
+    }
+    # See deploy.js: caps the up-front EIP-1559 reservation so a faucet-sized
+    # balance is enough. Unset = let web3 pick.
+    if os.getenv("MAX_FEE_GWEI"):
+        params["maxFeePerGas"] = w3.to_wei(float(os.getenv("MAX_FEE_GWEI")), "gwei")
+        params["maxPriorityFeePerGas"] = w3.to_wei(0.001, "gwei")
+    tx = contract.functions.storeRecord(record_id, data_hash).build_transaction(params)
     signed = account.sign_transaction(tx)
     tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
     receipt = w3.eth.wait_for_transaction_receipt(tx_hash, timeout=300)

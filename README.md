@@ -35,6 +35,23 @@ demonstrates a pipeline; it does not establish who anyone is.
 
 ---
 
+## Live deployment (Sepolia)
+
+The contract is deployed and a record is anchored on the public Sepolia testnet
+— verifiable by anyone, no setup required:
+
+| | |
+|---|---|
+| Contract | [`0xC7001716a1C515039A1DEF6d7DbB44c6a44C7044`](https://sepolia.etherscan.io/address/0xC7001716a1C515039A1DEF6d7DbB44c6a44C7044) |
+| Deploy tx | [`0x084db7a7…59c594`](https://sepolia.etherscan.io/tx/0x084db7a7f1fc6c15db15257908883028e25638da3eb5c5f32cb816f24259c594) (382,309 gas) |
+| `storeRecord` tx | [`0xf56b3822…c141d7`](https://sepolia.etherscan.io/tx/0xf56b38221b9c86184ebfaace8dbb98a98f40f18c8b3d34719fbbc12e36c141d7) (91,326 gas, block 11650015) |
+| Total cost | 0.000499 ETH |
+
+Re-verification against that live record returns `VERIFIED ✅`; altering one
+character of `output/match_result.json` returns `MISMATCH ❌` and exit code 1.
+
+---
+
 ## Architecture
 
 ```
@@ -147,11 +164,21 @@ python main.py photo.jpg                                  # terminal 2
 
 ### Option B — Sepolia testnet
 
+No RPC signup needed — this public endpoint works:
+
 ```bash
-# .env has SEPOLIA_RPC_URL and PRIVATE_KEY, wallet funded from a faucet
+# .env:
+#   SEPOLIA_RPC_URL=https://ethereum-sepolia-rpc.publicnode.com
+#   PRIVATE_KEY=<throwaway wallet, funded from a Sepolia faucet>
+
 npx hardhat run scripts/deploy.js --network sepolia
 python main.py photo.jpg
 ```
+
+The deploy script refuses to run on a zero-balance wallet and tells you to use
+a faucet, rather than failing halfway through with a gas error. `verify.py`
+refuses to touch a mainnet chain ID at all, and refuses any chain that doesn't
+match the one in `deployment.json`.
 
 ### Stages independently
 

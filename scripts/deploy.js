@@ -16,8 +16,19 @@ async function main() {
     throw new Error("deployer has no ETH -- fund it from a Sepolia faucet, or use --network localhost");
   }
 
+  // EIP-1559 reserves gasLimit * maxFeePerGas up front, and ethers defaults
+  // maxFeePerGas to ~2x base fee -- so a faucet-sized balance can be refused
+  // even when the real cost is half of it. MAX_FEE_GWEI caps the reservation.
+  // Unset = ethers' safer default.
+  const overrides = {};
+  if (process.env.MAX_FEE_GWEI) {
+    overrides.maxFeePerGas = hre.ethers.parseUnits(process.env.MAX_FEE_GWEI, "gwei");
+    overrides.maxPriorityFeePerGas = hre.ethers.parseUnits("0.001", "gwei");
+    console.log(`Gas cap:  ${process.env.MAX_FEE_GWEI} gwei (MAX_FEE_GWEI)`);
+  }
+
   const factory = await hre.ethers.getContractFactory("Verification");
-  const contract = await factory.deploy();
+  const contract = await factory.deploy(overrides);
   await contract.waitForDeployment();
   const address = await contract.getAddress();
   console.log(`Deployed Verification -> ${address}`);
