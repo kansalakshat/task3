@@ -48,7 +48,7 @@ def main():
     print("\n  Consent-only tool. Run this on your own face, or on a face whose")
     print("  owner has explicitly agreed to be searched. See README.\n")
 
-    _banner(1, "FACE DETECTION + EMBEDDING (MediaPipe -> DeepFace/Facenet)")
+    _banner(1, "FACE DETECTION + ALIGNMENT + EMBEDDING (MediaPipe -> Facenet512)")
     try:
         face = detect.run(args.image, args.out_dir)
     except ValueError as e:
@@ -56,14 +56,16 @@ def main():
     box = face["bounding_box"]
     print(f"  face at x={box['x']} y={box['y']} w={box['w']} h={box['h']}")
     print(f"  crop      -> {face['face_crop']}")
-    print(f"  embedding -> {args.out_dir}/embedding.json ({face['dimensions']}-d Facenet)")
+    print(f"  embedding -> {args.out_dir}/embedding.json "
+          f"({face['dimensions']}-d {face['model']}, eye-aligned)")
 
-    _banner(2, "REVERSE IMAGE SEARCH (SerpAPI / Google Lens)")
-    match = search.run(face["face_crop"], args.out_dir)
+    _banner(2, "REVERSE IMAGE SEARCH + FACE VERIFICATION (SerpAPI / Google Lens)")
+    match = search.run(face["face_crop"], args.out_dir, embedding=face["embedding"])
     if match["matched"]:
-        print(f"  {match['total_returned']} visual match(es); top {len(match['matches'])} saved:")
+        print(f"  {match['total_returned']} candidate(s) from the engine; "
+              f"{len(match['matches'])} confirmed as this face:")
         for m in match["matches"]:
-            print(f"    - {m['source'] or '?'}: {m['url']}")
+            print(f"    - [d={m['distance']:.3f}] {m['source'] or '?'}: {m['url']}")
     else:
         print(f"  no confident match recorded ({match['note']})")
     print(f"  results   -> {args.out_dir}/match_result.json")

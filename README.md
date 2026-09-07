@@ -61,16 +61,19 @@ character of `output/match_result.json` returns `MISMATCH ❌` and exit code 1.
 ┌─────────────────────────────────────────────────────────────────┐
 │ STAGE 1  Face detection + encoding                              │
 │   mediapipe FaceDetector (BlazeFace)  → best-scoring face box   │
+│   rotate so the eye line is level     → aligned crop            │
 │   + 25% padding, clamped to frame     → output/face_crop.jpg    │
-│   DeepFace.represent(Facenet)         → output/embedding.json   │
+│   DeepFace.represent(Facenet512)      → output/embedding.json   │
 └─────────────────────────────────────────────────────────────────┘
       │  face_crop.jpg
       ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│ STAGE 2  Reverse image search                                   │
+│ STAGE 2  Reverse image search + face verification               │
 │   upload crop → public URL (permanent, see scope)               │
 │   SerpAPI  engine=google_lens  → visual_matches                 │
-│   top 5 {url, title, source} + search timestamp                 │
+│   re-embed each of the top 25 candidates and keep only those    │
+│   within Facenet512's cosine threshold (0.30) of the query face │
+│   best 5 {url, title, source, distance} + search timestamp      │
 │                                       → output/match_result.json│
 │   No match / no key / API down → recorded honestly, never faked │
 └─────────────────────────────────────────────────────────────────┘
@@ -98,8 +101,8 @@ does not belong there.
 ## Repo layout
 
 ```
-pipeline/detect.py       Stage 1 — MediaPipe crop + Facenet embedding
-pipeline/search.py       Stage 2 — SerpAPI reverse image search
+pipeline/detect.py       Stage 1 — MediaPipe align + crop + Facenet512 embedding
+pipeline/search.py       Stage 2 — SerpAPI search + per-candidate face check
 contracts/Verification.sol   Stage 3 — hash anchor contract
 scripts/deploy.js        Hardhat deploy → deployment.json (address + ABI)
 verify.py                Stage 3 — web3.py upload + re-verification
@@ -118,18 +121,18 @@ cp .env.example .env                # then fill in
 ```
 
 First run downloads two model files: the BlazeFace detector (~230 KB, into
-`models/`) and the Facenet weights (~90 MB, into `~/.deepface/weights/`).
+`models/`) and the Facenet512 weights (~91 MB, into `~/.deepface/weights/`).
 
 ### Troubleshooting
 
 - **`ValueError: ... requires tf-keras package`** — DeepFace needs `tf-keras`
   alongside TensorFlow ≥ 2.16. It is in `requirements.txt`; if you installed
   piecemeal, run `pip install tf-keras`.
-- **`An exception occurred while downloading facenet_weights.h5`** — DeepFace's
+- **`An exception occurred while downloading facenet512_weights.h5`** — DeepFace's
   downloader is flaky against GitHub releases. Fetch it manually:
   ```bash
-  curl -L -o ~/.deepface/weights/facenet_weights.h5 \
-    https://github.com/serengil/deepface_models/releases/download/v1.0/facenet_weights.h5
+  curl -L -o ~/.deepface/weights/facenet512_weights.h5 \
+    https://github.com/serengil/deepface_models/releases/download/v1.0/facenet512_weights.h5
   ```
 - **`HH502: Couldn't download compiler version list`** — transient; re-run
   `npx hardhat compile`.
@@ -249,9 +252,19 @@ pipeline is not blocked.
   pipeline continues rather than inventing a match.
 
 **Face matching**
-- Facenet embeddings are sensitive to pose, lighting, age, and occlusion. This
-  demo produces an embedding; it does **not** implement a verified matching
-  threshold, and no distance comparison gates the result.
+- Google Lens matches on whatever dominates the crop — on a face wearing
+  sunglasses it returned 60 eyewear product pages and zero photos of the
+  person. So the engine's ranking is not trusted: each of the top 25 candidates
+  is downloaded, run through the same detect → align → Facenet512 path, and
+  kept only if its cosine distance to the query face is within DeepFace's
+  calibrated threshold for the model (0.30). `matched: true` now means a face
+  passed that check, and each match records its `distance`.
+- Facenet512 embeddings are still sensitive to pose, lighting, age and
+  occlusion, and the threshold is a calibrated default, not a tuned one. False
+  negatives are the expected failure here, which is the right direction to err.
+- Input resolution is the binding limit. Faces under 40 px are refused outright
+  rather than embedded into noise, and a small face in the query image narrows
+  the margin against the threshold.
 - MediaPipe takes only the highest-confidence face. Group photos are not handled.
 - Nothing here is liveness-checked. A photo of a photo passes Stage 1.
 

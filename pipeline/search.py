@@ -12,8 +12,12 @@ import json
 import os
 import re
 
+import cv2
+import numpy as np
 import requests
 from dotenv import load_dotenv
+
+from pipeline import detect
 
 OUT_DIR = "output"
 
@@ -21,6 +25,20 @@ SERPAPI_URL = "https://serpapi.com/search"
 UPLOAD_URL = "https://catbox.moe/user/api.php"
 MAX_MATCHES = 5
 TIMEOUT = 60
+
+# Google Lens matches on whatever dominates the image. On a face crop that is
+# routinely the sunglasses, the hairline or the background -- it will happily
+# return sixty product pages that share nothing with the person. So every
+# candidate is re-embedded and distance-checked against the query face before
+# it counts as a match; CANDIDATES is how deep into the engine's ranking that
+# check reaches, since the true match is often not in the engine's top 5.
+CANDIDATES = 25
+DISTANCE_METRIC = "cosine"
+
+# Fetching a candidate image should not inherit the 60s API timeout; a slow
+# host would otherwise stall the whole check.
+FETCH_TIMEOUT = 15
+MAX_FETCH_BYTES = 12 * 1024 * 1024
 
 # The host rejects the default python-requests agent.
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -92,6 +110,63 @@ def _redact(text, secret):
     return text.replace(secret, "***REDACTED***") if secret else text
 
 
+def _fetch_image(url):
+    """Download an image URL into a BGR array. None if it is not usable."""
+    resp = requests.get(url, headers=HEADERS, timeout=FETCH_TIMEOUT, stream=True)
+    resp.raise_for_status()
+    # Capped read: these URLs come off arbitrary web pages, so an unbounded
+    # read is a remote party deciding how much memory this process uses.
+    data = resp.raw.read(MAX_FETCH_BYTES + 1)
+    if len(data) > MAX_FETCH_BYTES:
+        return None
+    return cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+
+
+def _face_distance(candidate, query_embedding):
+    """Cosine distance from the query face to the face in `candidate`.
+
+    None when the candidate holds no usable face at all -- which is the common
+    case, and precisely what the old code counted as a match.
+    """
+    from deepface.modules import verification
+
+    # Prefer the full image over the thumbnail: gstatic thumbnails are often
+    # too small for the face to survive MIN_FACE_PX, and a match dropped for
+    # being small is indistinguishable from one dropped for being wrong.
+    for url in (candidate.get("image"), candidate.get("thumbnail")):
+        if not url:
+            continue
+        try:
+            image = _fetch_image(url)
+        except (requests.RequestException, OSError):
+            continue
+        if image is None:
+            continue
+        embedding = detect.embed(image)
+        if embedding is not None:
+            return verification.find_cosine_distance(query_embedding, embedding)
+    return None
+
+
+def _verify(matches, query_embedding):
+    """Keep only candidates whose face is the query face, best first.
+
+    ponytail: serial fetch + embed, ~25 round trips. Thread the fetches if the
+    wait becomes the complaint -- the embeddings share a TF graph and should
+    stay on one thread.
+    """
+    from deepface.modules import verification
+
+    limit = verification.find_threshold(detect.MODEL_NAME, DISTANCE_METRIC)
+    scored = []
+    for m in matches[:CANDIDATES]:
+        distance = _face_distance(m, query_embedding)
+        if distance is not None and distance <= limit:
+            scored.append((distance, m))
+    scored.sort(key=lambda pair: pair[0])
+    return scored, limit
+
+
 def _write(result, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, "match_result.json")
@@ -100,8 +175,14 @@ def _write(result, out_dir):
     return path
 
 
-def run(crop_path, out_dir=OUT_DIR, api_key=None):
-    """Search the web for the cropped face. Never raises on 'no match found'."""
+def run(crop_path, out_dir=OUT_DIR, api_key=None, embedding=None):
+    """Search the web for the cropped face. Never raises on 'no match found'.
+
+    `embedding` is the stage 1 query vector. With it, every candidate the
+    engine returns is re-embedded and distance-checked, and only same-face
+    candidates are recorded. Without it the engine's ranking is taken on
+    trust, which is worth roughly nothing -- see CANDIDATES.
+    """
     # load_dotenv here, not just in main.py: the README documents running this
     # stage standalone, and without it .env is ignored and the search silently
     # reports "no key" even though one is configured.
@@ -114,6 +195,9 @@ def run(crop_path, out_dir=OUT_DIR, api_key=None):
         "matched": False,
         "matches": [],
         "note": "",
+        "face_verified": embedding is not None,
+        "model": detect.MODEL_NAME,
+        "distance_metric": DISTANCE_METRIC,
     }
 
     if not api_key:
@@ -134,18 +218,38 @@ def run(crop_path, out_dir=OUT_DIR, api_key=None):
         _write(result, out_dir)
         return result
 
-    for m in matches[:MAX_MATCHES]:
-        result["matches"].append({
+    if embedding is None:
+        # Unverified path: kept so this stage still runs standalone, but say
+        # plainly that nothing confirmed these are the same face.
+        kept = [(None, m) for m in matches[:MAX_MATCHES]]
+        result["note"] = "engine ranking only; faces not verified."
+    else:
+        kept, limit = _verify(matches, embedding)
+        result["threshold"] = limit
+        result["candidates_checked"] = min(len(matches), CANDIDATES)
+
+    for distance, m in kept[:MAX_MATCHES]:
+        entry = {
             "title": _clean(m.get("title")),
             "url": _clean(m.get("link")),
             "source": _clean(m.get("source")),
             "thumbnail": _clean(m.get("thumbnail")),
-        })
+        }
+        if distance is not None:
+            entry["distance"] = round(distance, 4)
+        result["matches"].append(entry)
     result["matched"] = bool(result["matches"])
     result["total_returned"] = len(matches)
     if not result["matched"]:
-        result["note"] = "no visual matches returned by the engine."
-        print("  ! no visual matches found.")
+        if embedding is not None and matches:
+            result["note"] = (
+                f"{result['candidates_checked']} candidate(s) checked; "
+                "none contained this face."
+            )
+            print(f"  ! no face-verified match in {result['candidates_checked']} candidate(s).")
+        else:
+            result["note"] = "no visual matches returned by the engine."
+            print("  ! no visual matches found.")
 
     _write(result, out_dir)
     return result
@@ -178,9 +282,25 @@ def _demo():
         assert r["matched"] is False and "failed" in r["note"], r
 
     # Engine-supplied text must lose control chars but keep ordinary content.
-    assert _clean("evil\x1b[31m\x00title") == "evil[31mtitle"
+    dirty = "evil" + chr(27) + "[31m" + chr(0) + "title"
+    assert _clean(dirty) == "evil[31mtitle"
     assert _clean("https://ok.example/a-b_c") == "https://ok.example/a-b_c"
     assert _clean(None) is None
+
+    # The whole point of stage 2's rewrite: a candidate with no face, and one
+    # with a different face, must both be dropped -- the sunglasses-product
+    # results that used to come back as confident "matches".
+    global _face_distance
+    real = _face_distance
+    scores = {"same": 0.11, "other": 0.62, "faceless": None}
+    _face_distance = lambda c, q: scores[c["link"]]
+    try:
+        kept, limit = _verify([{"link": k} for k in scores], [0.0] * 512)
+        assert [m["link"] for _, m in kept] == ["same"], kept
+        assert 0.11 < limit < 0.62, limit
+    finally:
+        _face_distance = real
+
     print("search.py self-check OK")
 
 
